@@ -80,3 +80,7 @@ models/
 
 # Local copies / experiments
 fusion/
+
+# Local temp
+init
+loading
