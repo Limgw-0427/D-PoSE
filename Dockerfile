@@ -1,28 +1,49 @@
-# Use the official Ubuntu 20.04 base image
-FROM ubuntu:20.04
+# D-PoSE pipeline service: Python 3.10, isolated Torch, file-based I/O.
+# Build context: D-PoSE repo root. Mount shared_data at /workspace/shared.
+# output.npz canonical path is created by docker-compose entrypoint.
 
-# Update the package lists and install Python 3.8, pip, and other dependencies
-RUN apt-get update && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    python3.8 python3-pip git libopenexr-dev libgl1 ffmpeg libsm6 libxext6 libglfw3-dev libgles2-mesa-dev libturbojpeg tmux wget && \
-    wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb && \
-    dpkg -i cuda-keyring_1.1-1_all.deb && \
-    apt-get update && \
-    DEBIAN_FRONTEND=noninteractive apt-get -y install cuda-toolkit-12-4 && \
-    rm cuda-keyring_1.1-1_all.deb && \
-    rm -rf /var/lib/apt/lists/*
+FROM python:3.10-slim-bookworm
 
-# Upgrade pip and setuptools
-RUN python3.8 -m pip install --upgrade pip setuptools
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PYOPENGL_PLATFORM=egl
 
-# Set the working directory
-WORKDIR /app
+# System deps for OpenCV, rendering, optional runtime libs (OpenEXR), and yolov3 weight download
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libopenexr-dev \
+    libimath-dev \
+    pkg-config \
+    libglfw3-dev \
+    libgles2-mesa-dev \
+    libturbojpeg0-dev \
+    ffmpeg \
+    git \
+    wget \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy the requirements.txt file to the working directory
-COPY requirements.txt .
+WORKDIR /workspace
 
-# Install Python dependencies from requirements.txt
-RUN pip install -r requirements.txt
+# Copy project
+COPY . .
 
-# Set the command to launch a bash shell
-CMD ["/bin/bash"]
+# pip 버전 고정 (26.x에서 chumpy 빌드 시 'No module named pip' 발생 방지)
+# chumpy는 별도로 --no-build-isolation 로 설치
+RUN pip install --no-cache-dir pip==25.3 setuptools==80.9.0 wheel==0.45.1 \
+    && grep -v '^chumpy==' requirements.txt > requirements-filtered.txt \
+    && pip install --no-cache-dir -r requirements-filtered.txt \
+    && pip install --no-cache-dir --no-build-isolation chumpy==0.70
+
+# yolov3 (multi_person_tracker) expects ~/.torch/models/yolov3.weights and ~/.torch/config/yolov3.cfg
+# Pre-download at build so runtime does not need outbound access to pjreddie.com / raw.githubusercontent.com
+RUN mkdir -p /root/.torch/models /root/.torch/config \
+    && wget -q -O /root/.torch/models/yolov3.weights 'https://pjreddie.com/media/files/yolov3.weights' \
+    && wget -q -O /root/.torch/config/yolov3.cfg 'https://raw.githubusercontent.com/mkocabas/yolov3-pytorch/master/yolov3/config/yolov3.cfg'
+
+# Pipeline runs: demo.py --image_folder /workspace/shared/inputs --output_folder /workspace/shared/dpose_out
+# output.npz and logging are handled by docker-compose command.

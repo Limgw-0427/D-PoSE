@@ -22,6 +22,42 @@ def main(args):
     )
     logger.info(f'Demo options: \n {args}')
 
+    # ----- image_folder / mount sanity check -----
+    if not os.path.isdir(input_image_folder):
+        logger.error(f"image_folder is not a directory: {input_image_folder}")
+        raise FileNotFoundError(f"image_folder is not a directory: {input_image_folder}")
+    all_names = os.listdir(input_image_folder)
+    IMG_EXT = ('.png', '.jpg', '.jpeg')
+    image_names = [n for n in all_names if n.lower().endswith(IMG_EXT)]
+    logger.info(f"image_folder={input_image_folder} | listdir count={len(all_names)} | images (.png/.jpg/.jpeg) count={len(image_names)}")
+    if all_names:
+        logger.info(f"First 5 listdir entries: {all_names[:5]}")
+    if not image_names:
+        # MPT only accepts .png/.jpg/.jpeg; if inputs are e.g. .webp, use a workdir with .jpg symlinks
+        EXTRA_EXT = ('.webp', '.bmp', '.tiff', '.tif')
+        extra = [n for n in all_names if n.lower().endswith(EXTRA_EXT)]
+        if extra:
+            import tempfile
+            import shutil
+            workdir = tempfile.mkdtemp(prefix="dpose_inputs_")
+            try:
+                for n in extra:
+                    src = os.path.join(input_image_folder, n)
+                    base = os.path.splitext(n)[0]
+                    lnk = os.path.join(workdir, base + ".jpg")
+                    os.symlink(src, lnk)
+                input_image_folder = workdir
+                image_names = [os.path.basename(os.path.splitext(n)[0] + ".jpg") for n in extra]
+                logger.info(f"Using workdir {workdir} with {len(image_names)} symlinks (.jpg) for MPT")
+            except Exception as e:
+                logger.warning(f"Could not create symlink workdir: {e}. Proceeding with original folder.")
+        else:
+            logger.warning(
+                f"No images with extension .png/.jpg/.jpeg in {input_image_folder}. "
+                "Multi-person tracker and D-PoSE expect filenames ending with these. "
+                f"All entries: {all_names[:20]}{'...' if len(all_names) > 20 else ''}"
+            )
+
     tester = Tester(args)
     if args.eval_dataset == 'hbw':
         all_image_folder = glob(os.path.join(input_image_folder, 'images', args.data_split + '_small_resolution', '*', '*'))
@@ -34,8 +70,23 @@ def main(args):
         tester.run_on_dataframe(dataframe_path, output_path, args.display)
     else:
         all_image_folder = [input_image_folder]
-        detections = tester.run_detector(all_image_folder)
-        tester.run_on_image_folder(all_image_folder, detections, output_path, args.display)
+        try:
+            detections = tester.run_detector(all_image_folder)
+        except Exception as e:
+            logger.exception(f"run_detector failed: {e}")
+            raise
+        num_frames = [len(d) for d in detections] if detections else []
+        logger.info(f"run_detector returned {len(detections)} folder(s), frame counts per folder: {num_frames}")
+        if not detections or all(len(d) == 0 for d in detections):
+            logger.error(
+                "Detector returned 0 frames. Check: (1) image_folder has .png/.jpg/.jpeg files, "
+                "(2) /workspace/shared/inputs is mounted (e.g. docker compose volume), "
+                "(3) no exception was swallowed inside multi_person_tracker."
+            )
+        tester.run_on_image_folder(
+            all_image_folder, detections, output_path, 
+            visualize_proj=args.display, 
+            export_only=True)
 
     del tester.model
 

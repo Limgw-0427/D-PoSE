@@ -49,7 +49,7 @@ class Tester:
         logger.info(f'Loaded pretrained weights from \"{self.args.ckpt}\"')
 
     def run_detector(self, all_image_folder):
-        # run multi object tracker
+        # run multi object tracker (MPT uses .png / .jpg / .jpeg only in ImageFolder)
         mot = MPT(
             device=self.device,
             batch_size=self.args.tracker_batch_size,
@@ -60,7 +60,15 @@ class Tester:
         )
         bboxes = []
         for fold_id, image_folder in enumerate(all_image_folder):
-            bboxes.append(mot.detect(image_folder))
+            try:
+                bboxes.append(mot.detect(image_folder))
+            except Exception as e:
+                logger.exception(
+                    f"mot.detect failed for image_folder={image_folder} (fold_id={fold_id}): {e}"
+                )
+                raise
+            n_frames = len(bboxes[-1]) if bboxes else 0
+            logger.info(f"mot.detect folder={image_folder} -> {n_frames} frames")
 
         return bboxes
 
@@ -73,14 +81,27 @@ class Tester:
                 self.bboxes_dict[fname] = bbox
 
     @torch.no_grad()
-    def run_on_image_folder(self, all_image_folder, detections, output_folder, visualize_proj=True):
+    def run_on_image_folder(self, all_image_folder, detections, output_folder, visualize_proj=True, export_only=False):
+        IMG_EXT = ('.png', '.jpg', '.jpeg')
+        # Accumulate per-image results for combined output.npz (one npz per folder, all persons)
+        combined_chunks = []
         for fold_idx, image_folder in enumerate(all_image_folder):
+            try:
+                listing = os.listdir(image_folder)
+            except OSError as e:
+                logger.exception(f"os.listdir({image_folder}) failed: {e}")
+                raise
             image_file_names = [
                 os.path.join(image_folder, x)
-                for x in os.listdir(image_folder)
-                if x.endswith('.png') or x.endswith('.jpg') or x.endswith('.jpeg')
+                for x in listing
+                if x.lower().endswith(IMG_EXT)
             ]
-            image_file_names = (sorted(image_file_names))
+            image_file_names = sorted(image_file_names)
+            if not image_file_names:
+                logger.warning(
+                    f"run_on_image_folder: no .png/.jpg/.jpeg in {image_folder} "
+                    f"(listdir count={len(listing)}, first 5: {listing[:5]})"
+                )
             for img_idx, img_fname in tqdm.tqdm(enumerate(image_file_names)):
                 
                 dets = detections[fold_idx][img_idx]
@@ -117,35 +138,138 @@ class Tester:
                 else:
                     hmr_output,orig_depth,_,_,segmentation = self.model(inp_images, bbox_center=bbox_center, bbox_scale=bbox_scale, img_w=img_w, img_h=img_h)
 
-                focal_length = (img_w * img_w + img_h * img_h) ** 0.5
-                pred_vertices_array = (hmr_output['vertices'] + hmr_output['pred_cam_t'].unsqueeze(1)).detach().cpu().numpy()
-                renderer = Renderer(focal_length=focal_length[0], img_w=img_w[0], img_h=img_h[0],
-                                    faces=self.smplx_cam_head.smplx.faces,
-                                    same_mesh_color=False)
-                front_view = renderer.render_front_view(pred_vertices_array,
-                                                        bg_img_rgb=img.copy())
+                # ===== EXPORT FOR LATE FUSION =====
+                os.makedirs(output_folder, exist_ok=True)
+                basename = os.path.splitext(os.path.basename(img_fname))[0]
+                out_npz = os.path.join(output_folder, f"{basename}_dpose.npz")
 
-                # save rendering results
-                basename = img_fname.split('/')[-1]
-                filename = basename + "pred_%s.jpg" % 'bedlam'
-                filename_orig = basename + "orig_%s.jpg" % 'bedlam'
-                front_view_path = os.path.join(output_folder, filename)
-                orig_path = os.path.join(output_folder, filename_orig)
-                logger.info(f'Writing output files to {output_folder}')
-                '''
-                cv2.imwrite(front_view_path, front_view[:, :, ::-1])
-                cv2.imwrite(orig_path, img[:, :, ::-1])
-                #import ipdb; ipdb.set_trace()
-                cv2.imwrite(os.path.join(output_folder, filename + "depth.jpg"), orig_depth[0].detach().cpu().numpy().reshape(orig_depth.shape[2],orig_depth.shape[3])*255)
-                segmentation = segmentation[0].detach().cpu().numpy()
-                segmentation = np.argmax(segmentation, axis=0)
-                plt.imshow(segmentation, cmap='viridis')
-                plt.axis('off')
-                plt.savefig(os.path.join(output_folder, filename + "segmentation.jpg"))
-                #cv2.imwrite(os.path.join(output_folder, filename + "segmentation.jpg"), segmentation)
-                #import ipdb; ipdb.set_trace()
-                '''
-                renderer.delete()
+                save_dict = {
+                   "img_fname": img_fname,
+                    "orig_height": int(orig_height),
+                    "orig_width": int(orig_width),
+                    "bbox_center": bbox_center.detach().cpu().numpy(),  # (B,2)
+                    "bbox_scale": bbox_scale.detach().cpu().numpy(),    # (B,)
+                }
+
+                # hmr_output tensors -> numpy
+                for k, v in hmr_output.items():
+                    if torch.is_tensor(v):
+                        save_dict[k] = v.detach().cpu().numpy()
+
+                    # optional: depth/seg
+                if self.hparams.DATASET.USE_DEPTH:
+                    if torch.is_tensor(orig_depth):
+                        save_dict["orig_depth"] = orig_depth.detach().cpu().numpy()
+                    if torch.is_tensor(segmentation):
+                        save_dict["segmentation_logits"] = segmentation.detach().cpu().numpy()
+                        seg_np = segmentation.detach().cpu().numpy()
+                        # usually (B,C,H,W) -> mask (B,H,W)
+                        if seg_np.ndim == 4:
+                            save_dict["segmentation_mask"] = np.argmax(seg_np, axis=1)
+                        elif seg_np.ndim == 3:
+                            save_dict["segmentation_mask"] = np.argmax(seg_np, axis=0)
+
+                np.savez_compressed(out_npz, **save_dict)
+                logger.info(f"[EXPORT] Saved: {out_npz} (B={batch_size} persons)")
+
+                # Accumulate for combined output.npz: img_fname per person (for fusion image-level grouping)
+                chunk = dict(save_dict)
+                chunk["img_fname"] = np.array([save_dict["img_fname"]] * batch_size, dtype=object)
+                combined_chunks.append(chunk)
+                # =================================
+
+
+
+                focal_length = (img_w * img_w + img_h * img_h) ** 0.5
+                # pred_vertices_array = (hmr_output['vertices'] + hmr_output['pred_cam_t'].unsqueeze(1)).detach().cpu().numpy()
+                # renderer = Renderer(focal_length=focal_length[0], img_w=img_w[0], img_h=img_h[0],
+                #                     faces=self.smplx_cam_head.smplx.faces,
+                #                     same_mesh_color=False)
+                # front_view = renderer.render_front_view(pred_vertices_array,
+                #                                         bg_img_rgb=img.copy())
+
+                # # save rendering results
+                # basename = img_fname.split('/')[-1]
+                # filename = basename + "pred_%s.jpg" % 'bedlam'
+                # filename_orig = basename + "orig_%s.jpg" % 'bedlam'
+                # front_view_path = os.path.join(output_folder, filename)
+                # orig_path = os.path.join(output_folder, filename_orig)
+                # logger.info(f'Writing output files to {output_folder}')
+                # '''
+                # cv2.imwrite(front_view_path, front_view[:, :, ::-1])
+                # cv2.imwrite(orig_path, img[:, :, ::-1])
+                # #import ipdb; ipdb.set_trace()
+                # cv2.imwrite(os.path.join(output_folder, filename + "depth.jpg"), orig_depth[0].detach().cpu().numpy().reshape(orig_depth.shape[2],orig_depth.shape[3])*255)
+                # segmentation = segmentation[0].detach().cpu().numpy()
+                # segmentation = np.argmax(segmentation, axis=0)
+                # plt.imshow(segmentation, cmap='viridis')
+                # plt.axis('off')
+                # plt.savefig(os.path.join(output_folder, filename + "segmentation.jpg"))
+                # #cv2.imwrite(os.path.join(output_folder, filename + "segmentation.jpg"), segmentation)
+                # #import ipdb; ipdb.set_trace()
+                # '''
+                # renderer.delete()
+                if visualize_proj and (not export_only):
+                    pred_vertices_array = (
+                        hmr_output['vertices']
+                        + hmr_output['pred_cam_t'].unsqueeze(1)
+                    ).detach().cpu().numpy()
+
+                    renderer = Renderer(
+                        focal_length=focal_length[0],
+                        img_w=img_w[0],
+                        img_h=img_h[0],
+                        faces=self.smplx_cam_head.smplx.faces,
+                        same_mesh_color=False
+                    )
+
+                    front_view = renderer.render_front_view(
+                        pred_vertices_array,
+                        bg_img_rgb=img.copy()
+                    )
+
+                    # save rendering results
+                    basename = img_fname.split('/')[-1]
+                    filename = basename + "pred_%s.jpg" % 'bedlam'
+                    filename_orig = basename + "orig_%s.jpg" % 'bedlam'
+                    front_view_path = os.path.join(output_folder, filename)
+                    orig_path = os.path.join(output_folder, filename_orig)
+
+                    logger.info(f'Writing output files to {output_folder}')
+
+                    
+                    cv2.imwrite(front_view_path, front_view[:, :, ::-1])
+                    cv2.imwrite(orig_path, img[:, :, ::-1])
+                    cv2.imwrite(os.path.join(output_folder, filename + "depth.jpg"),
+                                orig_depth[0].detach().cpu().numpy().reshape(
+                                    orig_depth.shape[2], orig_depth.shape[3]) * 255)
+                    segmentation = segmentation[0].detach().cpu().numpy()
+                    segmentation = np.argmax(segmentation, axis=0)
+                    plt.imshow(segmentation, cmap='viridis')
+                    plt.axis('off')
+                    plt.savefig(os.path.join(output_folder, filename + "segmentation.jpg"))
+                    
+                    renderer.delete()
+
+            # Write combined output.npz for this folder (all images, all persons) for late fusion
+            if combined_chunks:
+                all_keys = list(combined_chunks[0].keys())
+                merged = {}
+                for k in all_keys:
+                    c0 = combined_chunks[0][k]
+                    if k == "img_fname":
+                        merged[k] = np.concatenate([c[k] for c in combined_chunks], axis=0)
+                    elif k in ("orig_height", "orig_width") or (not isinstance(c0, np.ndarray) and np.isscalar(c0)):
+                        n_per_chunk = [c["bbox_center"].shape[0] for c in combined_chunks]
+                        merged[k] = np.concatenate([np.full((n,), c[k], dtype=np.int64 if k in ("orig_height", "orig_width") else None) for c, n in zip(combined_chunks, n_per_chunk)], axis=0)
+                    elif isinstance(c0, np.ndarray) and c0.ndim >= 1:
+                        merged[k] = np.concatenate([c[k] for c in combined_chunks], axis=0)
+                    else:
+                        n_per_chunk = [c["bbox_center"].shape[0] for c in combined_chunks]
+                        merged[k] = np.concatenate([np.broadcast_to(np.asarray(c[k]), (n,)) for c, n in zip(combined_chunks, n_per_chunk)], axis=0)
+                out_combined = os.path.join(output_folder, "output.npz")
+                np.savez_compressed(out_combined, **merged)
+                logger.info(f"[EXPORT] Combined: {out_combined} (N={merged['bbox_center'].shape[0]} instances from {len(combined_chunks)} images)")
 
     @torch.no_grad()
     def run_on_hbw_folder(self, all_image_folder, detections, output_folder, data_split='test', visualize_proj=True):
@@ -257,6 +381,43 @@ class Tester:
             else:
                 hmr_output,_,_,_ = self.model(rgb_img.unsqueeze(0), bbox_center=center.unsqueeze(0), bbox_scale=scale.unsqueeze(0), img_w=img_w, img_h=img_h)
             # Need to convert SMPL-X meshes to SMPL using conversion tool before calculating error
+            
+            #내가 추가한부분
+            # ---------- SAVE (for late fusion) ----------
+            os.makedirs(output_folder, exist_ok=True)
+
+            basename = os.path.splitext(os.path.basename(img_fname))[0]
+            out_npz = os.path.join(output_folder, f"{basename}.npz")
+
+            save_dict = {
+                "img_fname": img_fname,
+                "orig_height": int(orig_height),
+                "orig_width": int(orig_width),
+                "bbox_center": bbox_center.detach().cpu().numpy(),  # (B,2)
+                "bbox_scale": bbox_scale.detach().cpu().numpy(),    # (B,)
+                }
+
+            # hmr_output keys: pred_pose, pred_shape, pred_cam, pred_cam_t, vertices, ...
+            for k, v in hmr_output.items():
+                if torch.is_tensor(v):
+                    save_dict[k] = v.detach().cpu().numpy()
+
+            # optional outputs
+            if self.hparams.DATASET.USE_DEPTH:
+                # orig_depth: (B,1,H,W) 형태일 가능성 높음
+                if torch.is_tensor(orig_depth):
+                    save_dict["orig_depth"] = orig_depth.detach().cpu().numpy()
+                if torch.is_tensor(segmentation):
+                    save_dict["segmentation_logits"] = segmentation.detach().cpu().numpy()
+                    # argmax mask도 같이 저장 (B,H,W)
+                    seg = segmentation.detach().cpu().numpy()
+                    save_dict["segmentation_mask"] = np.argmax(seg, axis=1)  # (B,H,W) or check dims
+
+            np.savez_compressed(out_npz, **save_dict)
+            logger.info(f"[EXPORT] Saved: {out_npz}")
+            # -------------------------------------------
+
+
             import trimesh
             mesh = trimesh.Trimesh(vertices=hmr_output['vertices'][0].detach().cpu().numpy(),faces=self.smplx_cam_head.smplx.faces)
             output_mesh_path = os.path.join(output_folder, str(ind)+'.obj')
@@ -265,20 +426,31 @@ class Tester:
             if visualize_proj:
                 focal_length = (img_w * img_w + img_h * img_h) ** 0.5
 
-                pred_vertices_array = (hmr_output['vertices'][0] + hmr_output['pred_cam_t']).unsqueeze(0).detach().cpu().numpy()
-                renderer = Renderer(focal_length=focal_length, img_w=img_w, img_h=img_h,
-                                    faces=self.smplx_cam_head.smplx.faces,
-                                    same_mesh_color=False)
-                front_view = renderer.render_front_view(pred_vertices_array,
-                                                        bg_img_rgb=img.copy())
+                # pred_vertices_array = (hmr_output['vertices'][0] + hmr_output['pred_cam_t']).unsqueeze(0).detach().cpu().numpy()
+                # renderer = Renderer(focal_length=focal_length, img_w=img_w, img_h=img_h,
+                #                     faces=self.smplx_cam_head.smplx.faces,
+                #                     same_mesh_color=False)
+                # front_view = renderer.render_front_view(pred_vertices_array,
+                #                                         bg_img_rgb=img.copy())
 
-                # save rendering results
-                basename = str(ind)
-                filename = basename + "pred_%s.jpg" % 'bedlam'
-                filename_orig = basename + "orig_%s.jpg" % 'bedlam'
-                front_view_path = os.path.join(output_folder, filename)
-                orig_path = os.path.join(output_folder, filename_orig)
-                logger.info(f'Writing output files to {output_folder}')
-                cv2.imwrite(front_view_path, front_view[:, :, ::-1])
-                cv2.imwrite(orig_path, img[:, :, ::-1])
+                # # save rendering results
+                # basename = str(ind)
+                # filename = basename + "pred_%s.jpg" % 'bedlam'
+                # filename_orig = basename + "orig_%s.jpg" % 'bedlam'
+                # front_view_path = os.path.join(output_folder, filename)
+                # orig_path = os.path.join(output_folder, filename_orig)
+                # logger.info(f'Writing output files to {output_folder}')
+                # cv2.imwrite(front_view_path, front_view[:, :, ::-1])
+                # cv2.imwrite(orig_path, img[:, :, ::-1])
+                # renderer.delete()
+                if visualize_proj and (not export_only):
+                    pred_vertices_array = (hmr_output['vertices'] + hmr_output['pred_cam_t'].unsqueeze(1)).detach().cpu().numpy()
+                    renderer = Renderer(
+                        focal_length=focal_length[0],
+                        img_w=img_w[0],
+                        img_h=img_h[0],
+                        faces=self.smplx_cam_head.smplx.faces,
+                        same_mesh_color=False
+                )
+                front_view = renderer.render_front_view(pred_vertices_array, bg_img_rgb=img.copy())
                 renderer.delete()

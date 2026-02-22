@@ -17,3 +17,66 @@ output/
 *.csv
 .DS_Store
 /demo_images/
+# Local / secrets / history
+.bash_history
+.wget-hsts
+
+# Cache
+.cache/
+.torch/
+**/.cache/
+**/.torch/
+
+# Data / outputs
+shared_data/
+data/
+datasets/
+outputs/
+results/
+logs/
+runs/
+
+# Weights / models
+models/
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.engine
+*.npz
+*.pkl
+
+# Local copies / experiments
+fusion/
+
+# Local / secrets / history
+.bash_history
+.wget-hsts
+
+# Cache
+.cache/
+.torch/
+**/.cache/
+**/.torch/
+
+# Data / outputs
+shared_data/
+data/
+datasets/
+outputs/
+results/
+logs/
+runs/
+
+# Weights / models
+models/
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.engine
+*.npz
+*.pkl
+
+# Local copies / experiments
+fusion/

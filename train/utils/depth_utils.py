@@ -1,4 +1,4 @@
-import OpenEXR, Imath
+import OpenEXR
 import numpy as np
 import cv2
 from scipy.special import expit
@@ -10,20 +10,21 @@ import trimesh
 import pyrender
 import colorsys
 from matplotlib import cm as mpl_cm, colors as mpl_colors
+
+
 def read_depth_exr(path):
-    """Reads depth map from EXR file.
+    """Reads depth map from EXR file (OpenEXR 3 API).
     Args:
         path: Path to the EXR file.
     Returns:
-        depth: Depth map as a numpy array.
+        depth: Depth map as a numpy array (float32, shape HxW).
     """
-    f = OpenEXR.InputFile(path)
-    dw = f.header()['dataWindow']
-    (width, height) = (dw.max.x - dw.min.x + 1, dw.max.y - dw.min.y + 1)
-    c = f.channel('Depth', Imath.PixelType(Imath.PixelType.FLOAT))
-    depth = np.fromstring(c, dtype=np.float32)
-    depth = np.reshape(depth, (height, width))
-    return depth
+    with OpenEXR.File(path) as f:
+        ch = f.channels()
+        if "Depth" not in ch:
+            raise KeyError(f"EXR file has no 'Depth' channel: {path}")
+        depth = ch["Depth"].pixels
+    return np.asarray(depth, dtype=np.float32)
 
 def read_segmentation_mask_env(path):
     """Reads segmentation mask from PNG file.
