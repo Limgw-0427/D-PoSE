@@ -1,0 +1,79 @@
+# File-based Docker Compose pipeline: hsmr -> dpose -> fusion (sequential).
+# Run from this directory. Ensure HSMR and fusion are at ../HSMR and ../fusion,
+# or set build context paths via environment variables.
+# Usage: ./run_full_pipeline.sh  (sequential: docker compose run --rm hsmr; dpose; fusion)
+#
+# GPU 설정: runtime: nvidia 사용 (deploy.resources 방식 대신, 더 호환성 좋음)
+
+services:
+  hsmr:
+    build:
+      context: ${HSMR_CONTEXT:-../HSMR}
+      dockerfile: Dockerfile
+    image: pipeline-hsmr:latest
+    container_name: pipeline-hsmr
+    volumes:
+      - shared_data:/workspace/shared
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        mkdir -p /workspace/shared/logs /workspace/shared/hsmr_out
+        python exp/run_demo.py -i /workspace/shared/inputs -o /workspace/shared/hsmr_out 2>&1 | tee /workspace/shared/logs/hsmr.log
+        exit $${PIPESTATUS[0]}
+    profiles:
+      - pipeline
+
+  dpose:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pipeline-dpose:latest
+    container_name: pipeline-dpose
+    volumes:
+      - shared_data:/workspace/shared
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        mkdir -p /workspace/shared/logs /workspace/shared/dpose_out
+        python demo.py --image_folder /workspace/shared/inputs --output_folder /workspace/shared/dpose_out --cfg configs/dpose_conf.yaml --ckpt data/ckpt/paper_arxiv.ckpt 2>&1 | tee /workspace/shared/logs/dpose.log
+        RC=$${PIPESTATUS[0]}
+        FIRST_NPZ=$$(ls /workspace/shared/dpose_out/*_dpose.npz 2>/dev/null | head -1)
+        if [ -n "$$FIRST_NPZ" ] && [ -f "$$FIRST_NPZ" ]; then
+          cp "$$FIRST_NPZ" /workspace/shared/dpose_out/output.npz
+        fi
+        exit $$RC
+    profiles:
+      - pipeline
+
+  fusion:
+    build:
+      context: ${FUSION_CONTEXT:-../fusion}
+      dockerfile: Dockerfile
+    image: pipeline-fusion:latest
+    container_name: pipeline-fusion
+    volumes:
+      - shared_data:/workspace/shared
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        mkdir -p /workspace/shared/logs /workspace/shared/fusion_out
+        python scripts/run_fusion.py \
+          --hsmr-npz /workspace/shared/hsmr_out/export/me_hsmr.npz \
+          --dpose-npz /workspace/shared/dpose_out/output.npz \
+          --output /workspace/shared/fusion_out/fused_f1.npz 2>&1 | tee /workspace/shared/logs/fusion.log
+        exit $${PIPESTATUS[0]}
+    profiles:
+      - pipeline
+
+volumes:
+  shared_data:
+    name: shared_data
